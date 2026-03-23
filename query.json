@@ -1,0 +1,50 @@
+// Public IP create/update, delete (Start/Accept/Succeeded), and association events (NIC/LB)
+// Always emit ONE row per PIP, preferring earliest delete phase (Start > Accept > Succeeded).
+let recent = 10m;
+let src = AzureActivity
+    | where TimeGenerated >= ago(recent)
+    | where OperationNameValue in (
+        "MICROSOFT.NETWORK/PUBLICIPADDRESSES/WRITE",
+        "MICROSOFT.NETWORK/PUBLICIPADDRESSES/DELETE",
+        "MICROSOFT.NETWORK/NETWORKINTERFACES/IPCONFIGURATIONS/WRITE",
+        "MICROSOFT.NETWORK/LOADBALANCERS/WRITE"
+        )
+    | extend Props = todynamic(Properties), Auth = todynamic(Authorization);
+
+// Extract PIP ids (also from NIC/LB props)
+let withPipId = src
+| extend PipIdsFromProps = extract_all(@"(/subscriptions/[^""\s]+/resource[Gg]roups/[^""\s]+/providers/Microsoft\.Network/publicIPAddresses/[^""\s/]+)", tostring(Properties))
+| extend SelfPipId = iff(OperationNameValue has "PUBLICIPADDRESSES",
+                         coalesce(tostring(ResourceId), tostring(Props.resourceId), tostring(Props.resourceUri), tostring(Auth.scope)),
+                         "")
+| extend PipIdArray = case(isnotempty(SelfPipId), pack_array(SelfPipId),
+                           array_length(PipIdsFromProps) > 0, PipIdsFromProps,
+                           dynamic(null))
+| mv-expand PipId = PipIdArray
+| extend PipId = tostring(PipId)
+| where isnotempty(PipId);
+
+// Writes and associations
+let writes = withPipId
+| where OperationNameValue == "MICROSOFT.NETWORK/PUBLICIPADDRESSES/WRITE"
+  and ActivityStatusValue == "Success";
+
+let assoc = withPipId
+| where OperationNameValue in ("MICROSOFT.NETWORK/NETWORKINTERFACES/IPCONFIGURATIONS/WRITE","MICROSOFT.NETWORK/LOADBALANCERS/WRITE")
+  and ActivityStatusValue == "Success";
+
+// Deletes — prefer earliest (Start > Accept > Succeeded)
+let deletes = withPipId
+| where OperationNameValue == "MICROSOFT.NETWORK/PUBLICIPADDRESSES/DELETE"
+  and ActivityStatusValue in ("Start","Accept","Succeeded")
+| extend StatusRank = case(ActivityStatusValue == "Start", 0, ActivityStatusValue == "Accept", 1, ActivityStatusValue == "Succeeded", 2, 3)
+| summarize arg_min(StatusRank, TimeGenerated, *) by tostring(PipId)
+| project-away StatusRank;
+
+// Final output
+writes
+| union assoc
+| union deletes
+| project TimeGenerated, OperationNameValue, ActivityStatusValue, ResourceId = PipId, Caller
+| order by TimeGenerated desc
+| where TimeGenerated >= ago(90s)
